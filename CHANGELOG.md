@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `QueryDFASet`: compile several queries into one DFA whose accepting states
+  record which queries accept there (the `RegexSet` analogue). The alphabet
+  and disjoint index-range partition are shared across the queries, the
+  document is walked once, and every match (`SetMatch`) carries the indices
+  of the queries that matched it. Comes with the same constructor family as
+  `QueryDFA` (`from_queries`, `from_query_strs`, `_ignore_case` and
+  `_bounded` variants; the state budget applies to the combined automaton)
+  and `find`/`find_limited`/`for_each_match`.
+- `-e`/`--query <QUERY>`: give several queries on the command line (like
+  `grep -e`). All of them are compiled into one automaton and run in a single
+  pass; a value matched by several queries is printed and counted once, and
+  the positional arguments are all treated as files.
+- `--with-query`: attribute matches to the queries that matched them. Each
+  match's header starts with the ascending indices of its queries (`0,1:`,
+  followed by the path when path headers are on); with `--count` it prints one
+  count per query (`QUERY:COUNT`, `FILE:QUERY:COUNT` for several files), and
+  with `-l` the matching queries of each file (`FILE:QUERIES`). `-m` keeps
+  limiting matched values, not matches per query.
+- `QueryDFASet::count_per_query`, `count_per_query_limited` and
+  `matching_queries`: per-query counts and the set of matching queries in one
+  document walk, without collecting matches.
+- `cli::write_attributed_result` and `cli::format_query_indices`.
+
 ## [0.10.0] - 2026-08-27
 
 ### Added

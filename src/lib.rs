@@ -122,6 +122,8 @@ pub use serde_json_borrow::Value;
 /// This is the simplest entry point for the library. For repeated queries
 /// against different documents, prefer compiling the query once with
 /// [`query::QueryDFA::from_query_str`] and calling [`query::QueryDFA::find`].
+/// To run several queries in one pass and learn which of them matched each
+/// value, compile them together into a [`query::QueryDFASet`].
 ///
 /// # Errors
 ///

@@ -305,6 +305,103 @@ impl QueryNFA {
     }
 }
 
+/// The NFAs of several queries laid side by side in one state universe, so
+/// that a single subset construction determinizes all of them at once.
+///
+/// Every state remembers the query it came from; this is how the resulting
+/// DFA learns, per accepting state, *which* queries accept there rather than
+/// merely whether some query does. The alphabet positions (`pos_to_label`)
+/// are concatenated in the same order as the states.
+#[derive(Debug)]
+pub struct QueryNFASet {
+    /// Total number of states across all member NFAs.
+    pub num_states: usize,
+
+    /// Transition function in the same shape as [`QueryNFA::transitions`],
+    /// with label indices and destinations rebased into the shared universe.
+    pub transitions: Vec<Vec<(usize, usize)>>,
+
+    /// Concatenated linearized alphabets of the member NFAs.
+    pub pos_to_label: Vec<TransitionLabel>,
+
+    /// Start state of each member NFA, indexed by query.
+    pub start_states: Vec<usize>,
+
+    /// Bitmap of accepting states.
+    pub is_accepting: Vec<bool>,
+
+    /// `state_query`\[state\] = index of the query the state belongs to.
+    pub state_query: Vec<usize>,
+}
+
+impl QueryNFASet {
+    /// Construct the NFAs of `queries` and lay them out side by side. State
+    /// and label indices of the `i`-th NFA are offset by the totals of the
+    /// NFAs before it, so states of one query occupy a contiguous block.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any query contains [`Query::Regex`]; see
+    /// [`QueryNFA::from_query`].
+    #[must_use]
+    pub fn from_queries(queries: &[Query]) -> Self {
+        let mut set = Self {
+            num_states: 0,
+            transitions: Vec::new(),
+            pos_to_label: Vec::new(),
+            start_states: Vec::with_capacity(queries.len()),
+            is_accepting: Vec::new(),
+            state_query: Vec::new(),
+        };
+
+        for (query_idx, query) in queries.iter().enumerate() {
+            let nfa = QueryNFA::from_query(query);
+            let state_offset = set.num_states;
+            let label_offset = set.pos_to_label.len();
+
+            set.start_states.push(state_offset + nfa.start_state);
+            for state in 0..nfa.num_states {
+                // The empty-query NFA has no transition rows at all.
+                let row =
+                    nfa.transitions.get(state).map_or_else(Vec::new, |row| {
+                        row.iter()
+                            .map(|&(label, dest)| {
+                                (label_offset + label, state_offset + dest)
+                            })
+                            .collect()
+                    });
+                set.transitions.push(row);
+                set.is_accepting.push(nfa.is_accepting[state]);
+                set.state_query.push(query_idx);
+            }
+            set.pos_to_label.extend(nfa.pos_to_label);
+            set.num_states += nfa.num_states;
+        }
+
+        set
+    }
+
+    /// The queries (ascending, without duplicates) that accept in some
+    /// member of `states`, a bitset over this universe in 64-bit blocks.
+    #[must_use]
+    pub fn accepting_queries(&self, states: &[u64]) -> Vec<usize> {
+        let mut queries = Vec::new();
+        for (block_idx, &block) in states.iter().enumerate() {
+            let mut bits = block;
+            while bits != 0 {
+                let state = block_idx * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if self.is_accepting[state] {
+                    queries.push(self.state_query[state]);
+                }
+            }
+        }
+        // States are laid out query by query, so the indices arrive sorted.
+        queries.dedup();
+        queries
+    }
+}
+
 /// Recursively determines whether the empty word is a member of L(e').
 pub fn contains_empty_word(query: &Query) -> bool {
     match query {

@@ -356,16 +356,66 @@ pub fn write_colored_result<W: Write>(
     path: &[PathType],
     options: &WriteOptions,
 ) -> anyhow::Result<bool> {
+    write_result(writer, value, path, None, options)
+}
+
+/// Like [`write_colored_result`], but attributes the result to the queries
+/// (indices into a query set) that matched it.
+///
+/// The header line is always written for text output formats and starts
+/// with the comma-separated query indices, followed by the path when the
+/// path header is enabled: `0,2:users.[1].name:`, or `0,2:` without a path.
+/// Binary output formats get no header, as with [`write_colored_result`].
+///
+/// # Errors
+///
+/// Returns an error if writing to `writer` fails for any reason other than a
+/// broken pipe.
+pub fn write_attributed_result<W: Write>(
+    writer: &mut W,
+    value: &Value,
+    path: &[PathType],
+    queries: &[usize],
+    options: &WriteOptions,
+) -> anyhow::Result<bool> {
+    write_result(writer, value, path, Some(queries), options)
+}
+
+/// Formats query indices as a comma-separated list, e.g. `0,2`.
+#[must_use]
+pub fn format_query_indices(queries: &[usize]) -> String {
+    queries.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+}
+
+/// Shared implementation of [`write_colored_result`] and
+/// [`write_attributed_result`].
+fn write_result<W: Write>(
+    writer: &mut W,
+    value: &Value,
+    path: &[PathType],
+    queries: Option<&[usize]>,
+    options: &WriteOptions,
+) -> anyhow::Result<bool> {
     let binary = options.output_format.is_binary();
     let result = (|| -> io::Result<()> {
-        if !binary && options.show_path && !path.is_empty() {
-            let mut header = String::new();
-            for (i, part) in path.iter().enumerate() {
-                if i > 0 {
-                    header.push('.');
-                }
-                header.push_str(&part.to_string());
+        let path_header = (!binary && options.show_path && !path.is_empty())
+            .then(|| {
+                path.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
+        if !binary && let Some(queries) = queries {
+            write!(
+                writer,
+                "{}:",
+                format_query_indices(queries).bold().green()
+            )?;
+            if let Some(header) = &path_header {
+                write!(writer, "{}:", header.bold().magenta())?;
             }
+            writeln!(writer)?;
+        } else if let Some(header) = path_header {
             writeln!(writer, "{}:", header.bold().magenta())?;
         }
         if options.raw

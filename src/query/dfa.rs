@@ -8,6 +8,10 @@ determinized via the [subset construction](https://en.wikipedia.org/wiki/Powerse
 to yield a deterministic finite automaton that can be simulated directly against
 an input JSON document AST.
 
+Several queries can also be determinized together into a [`QueryDFASet`],
+whose accepting states record which of the queries accept, so that one walk
+of a document answers all of them at once.
+
 ## Related Work
 
 For an example of production-ready implementation, the
@@ -25,9 +29,10 @@ use std::{
 };
 
 use crate::query::{
-    QueryNFA, QueryParseError,
+    QueryParseError,
     ast::Query,
     common::{JSONPointer, PathType, TransitionLabel},
+    nfa::QueryNFASet,
 };
 
 /// Error returned when DFA determinization exceeds a configured state
@@ -172,6 +177,17 @@ impl Display for QueryDFA {
                 .filter_map(|(i, &b)| if b { Some(i) } else { None })
                 .collect::<Vec<_>>()
         })?;
+        self.fmt_alphabet_and_transitions(f)
+    }
+}
+
+impl QueryDFA {
+    /// Write the alphabet and transition table, shared by the [`Display`]
+    /// impls of [`QueryDFA`] and [`QueryDFASet`].
+    fn fmt_alphabet_and_transitions(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
         writeln!(f, "Alphabet ({} symbols):", self.alphabet.len())?;
         for (i, sym) in self.alphabet.iter().enumerate() {
             writeln!(f, "\t{i}: {sym:?}")?;
@@ -515,6 +531,395 @@ impl QueryDFA {
     }
 }
 
+/// A value matched by at least one query of a [`QueryDFASet`], together with
+/// the queries that matched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetMatch<'a> {
+    /// Path to, and reference of, the matched value.
+    pub pointer: JSONPointer<'a>,
+    /// Ascending indices (into the set's query list) of every query whose
+    /// path language contains this value's path. Never empty.
+    pub queries: Vec<usize>,
+}
+
+/// Several queries compiled into a single [`QueryDFA`], whose accepting
+/// states remember *which* queries accept there.
+///
+/// This is the many-query analogue of [`QueryDFA`], in the spirit of
+/// `RegexSet` or `grep -e q1 -e q2`: the document is walked once, every
+/// matched value is reported once, and each match carries the indices of the
+/// queries that matched it. The alphabet (field symbols and the disjoint
+/// index-range partition) is shared across all queries, so compiling a set is
+/// no more expensive than compiling the disjunction of its members.
+///
+/// # Examples
+///
+/// ```text
+/// use jsongrep::{Value, query::QueryDFASet};
+///
+/// let json: Value = serde_json::from_str(
+///     r#"{"users": [{"name": "Ada", "age": 36}, {"name": "Bob"}]}"#,
+/// ).unwrap();
+/// let set = QueryDFASet::from_query_strs(&[
+///     "users[*].name",
+///     "users[*].*",
+///     "nowhere",
+/// ]).unwrap();
+///
+/// let matches = set.find(&json);
+/// assert_eq!(matches.len(), 3);
+/// // "name" values are matched by both the first and the second query.
+/// assert_eq!(matches[0].queries, vec![0, 1]);
+/// // "age" only by the second one.
+/// assert_eq!(matches[1].queries, vec![1]);
+/// ```
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct QueryDFASet {
+    /// The union automaton: it accepts exactly the paths accepted by at
+    /// least one query in the set and can be run on its own (e.g. via
+    /// [`QueryDFA::find`]) when the matching queries are not needed.
+    pub dfa: QueryDFA,
+
+    /// `accepting_queries`\[state\] = ascending indices of the queries that
+    /// accept in `state`; empty for non-accepting states.
+    pub accepting_queries: Vec<Vec<usize>>,
+
+    /// The number of queries in the set.
+    pub num_queries: usize,
+}
+
+impl Display for QueryDFASet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "DFA States: {}", self.dfa.num_states)?;
+        writeln!(f, "Start State: {}", self.dfa.start_state)?;
+        writeln!(f, "Queries: {}", self.num_queries)?;
+        writeln!(f, "Accepting States: {:?}", {
+            self.accepting_queries
+                .iter()
+                .enumerate()
+                .filter(|(_, queries)| !queries.is_empty())
+                .collect::<Vec<_>>()
+        })?;
+        self.dfa.fmt_alphabet_and_transitions(f)
+    }
+}
+
+impl QueryDFASet {
+    /// Compiles `queries` into one [`QueryDFASet`]. The index of a query in
+    /// this slice is the index reported in [`SetMatch::queries`]. An empty
+    /// slice yields a set that matches nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a query contains [`Query::Regex`]; see
+    /// [`QueryDFA::from_query`].
+    ///
+    /// Construction is unbounded; use [`QueryDFASet::from_queries_bounded`]
+    /// when compiling untrusted input.
+    #[must_use]
+    pub fn from_queries(queries: &[Query]) -> Self {
+        // A usize::MAX budget cannot be exceeded.
+        Self::build(queries, false, usize::MAX)
+            .unwrap_or_else(|_| unreachable!("unbounded DFA set build"))
+    }
+
+    /// Case-insensitive variant of [`QueryDFASet::from_queries`]: field
+    /// names of every query and JSON keys are compared after lowercasing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a query contains [`Query::Regex`]; see
+    /// [`QueryDFA::from_query`].
+    #[must_use]
+    pub fn from_queries_ignore_case(queries: &[Query]) -> Self {
+        // A usize::MAX budget cannot be exceeded.
+        Self::build(queries, true, usize::MAX)
+            .unwrap_or_else(|_| unreachable!("unbounded DFA set build"))
+    }
+
+    /// Parses every query string and compiles them into one
+    /// [`QueryDFASet`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first query string's parse error.
+    pub fn from_query_strs<S: AsRef<str>>(
+        queries: &[S],
+    ) -> Result<Self, QueryParseError> {
+        let queries = parse_all(queries)?;
+        Ok(Self::from_queries(&queries))
+    }
+
+    /// Case-insensitive variant of [`QueryDFASet::from_query_strs`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first query string's parse error.
+    pub fn from_query_strs_ignore_case<S: AsRef<str>>(
+        queries: &[S],
+    ) -> Result<Self, QueryParseError> {
+        let queries = parse_all(queries)?;
+        Ok(Self::from_queries_ignore_case(&queries))
+    }
+
+    /// Compiles `queries` into one [`QueryDFASet`], failing if
+    /// determinization would exceed `max_states` DFA states. The budget
+    /// applies to the combined automaton, not to each query separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateLimitExceeded`] when the budget is exhausted; see
+    /// [`QueryDFA::from_query_bounded`].
+    pub fn from_queries_bounded(
+        queries: &[Query],
+        max_states: usize,
+    ) -> Result<Self, StateLimitExceeded> {
+        Self::build(queries, false, max_states)
+    }
+
+    /// Case-insensitive variant of [`QueryDFASet::from_queries_bounded`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateLimitExceeded`] when the budget is exhausted.
+    pub fn from_queries_bounded_ignore_case(
+        queries: &[Query],
+        max_states: usize,
+    ) -> Result<Self, StateLimitExceeded> {
+        Self::build(queries, true, max_states)
+    }
+
+    /// Parses every query string and compiles them with a state budget in
+    /// one step: the safe entry point for untrusted query strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryCompileError::Parse`] for the first invalid query
+    /// string and [`QueryCompileError::StateLimit`] when determinization
+    /// would exceed `max_states`.
+    pub fn from_query_strs_bounded<S: AsRef<str>>(
+        queries: &[S],
+        max_states: usize,
+    ) -> Result<Self, QueryCompileError> {
+        let queries = parse_all(queries)?;
+        Ok(Self::from_queries_bounded(&queries, max_states)?)
+    }
+
+    /// Case-insensitive variant of [`QueryDFASet::from_query_strs_bounded`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryCompileError`]; see
+    /// [`QueryDFASet::from_query_strs_bounded`].
+    pub fn from_query_strs_bounded_ignore_case<S: AsRef<str>>(
+        queries: &[S],
+        max_states: usize,
+    ) -> Result<Self, QueryCompileError> {
+        let queries = parse_all(queries)?;
+        Ok(Self::from_queries_bounded_ignore_case(&queries, max_states)?)
+    }
+
+    /// Shared constructor that threads `case_insensitive` into the builder.
+    fn build(
+        queries: &[Query],
+        case_insensitive: bool,
+        max_states: usize,
+    ) -> Result<Self, StateLimitExceeded> {
+        let mut builder = DFABuilder::new();
+        builder.case_insensitive = case_insensitive;
+        builder.max_states = max_states;
+        builder.build_set(queries)
+    }
+
+    /// The queries (ascending) that accept in `state`; empty if `state` is
+    /// not an accepting state.
+    #[must_use]
+    pub fn accepting_queries_of(&self, state: usize) -> &[usize] {
+        self.accepting_queries.get(state).map_or(&[], Vec::as_slice)
+    }
+
+    /// Executes every query of the set in one document walk, returning each
+    /// matched value once in document order along with the queries that
+    /// matched it.
+    #[must_use]
+    pub fn find<'a>(&self, json: &'a Value<'a>) -> Vec<SetMatch<'a>> {
+        let mut results = Vec::new();
+        let _: ControlFlow<()> = self.for_each_match(json, |m| {
+            results.push(m);
+            ControlFlow::Continue(())
+        });
+        results
+    }
+
+    /// Like [`QueryDFASet::find`], but returns at most `limit` matches and
+    /// stops walking the document as soon as the limit is reached.
+    #[must_use]
+    pub fn find_limited<'a>(
+        &self,
+        json: &'a Value<'a>,
+        limit: usize,
+    ) -> Vec<SetMatch<'a>> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut results = Vec::new();
+        let _: ControlFlow<()> = self.for_each_match(json, |m| {
+            results.push(m);
+            if results.len() >= limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        results
+    }
+
+    /// Executes every query of the set in one document walk, invoking
+    /// `visit` for each matched value in document order; see
+    /// [`QueryDFA::for_each_match`] for the early-exit protocol.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// use std::ops::ControlFlow;
+    /// use jsongrep::{Value, query::QueryDFASet};
+    ///
+    /// let json: Value = serde_json::from_str(r#"{"a": 1, "b": 2}"#).unwrap();
+    /// let set = QueryDFASet::from_query_strs(&["a", "b", "c"]).unwrap();
+    ///
+    /// // Which queries match anywhere in the document?
+    /// let mut hit = vec![false; set.num_queries];
+    /// let _: ControlFlow<()> = set.for_each_match(&json, |m| {
+    ///     m.queries.iter().for_each(|&q| hit[q] = true);
+    ///     ControlFlow::Continue(())
+    /// });
+    /// assert_eq!(hit, vec![true, true, false]);
+    /// ```
+    pub fn for_each_match<'a, B, F>(
+        &self,
+        json: &'a Value<'a>,
+        mut visit: F,
+    ) -> ControlFlow<B>
+    where
+        F: FnMut(SetMatch<'a>) -> ControlFlow<B>,
+    {
+        DFAQueryEngine::visit_states_with_dfa(json, &self.dfa, |state, ptr| {
+            visit(SetMatch {
+                pointer: ptr,
+                queries: self.accepting_queries[state].clone(),
+            })
+        })
+    }
+
+    /// Counts, in one document walk, how many values each query of the set
+    /// matches. Entry `i` is the number of values query `i` matches on its
+    /// own, i.e. the length of [`QueryDFA::find`] for that query alone.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// use jsongrep::{Value, query::QueryDFASet};
+    ///
+    /// let json: Value = serde_json::from_str(
+    ///     r#"{"users": [{"name": "Ada", "age": 36}, {"name": "Bob"}]}"#,
+    /// ).unwrap();
+    /// let set = QueryDFASet::from_query_strs(&[
+    ///     "users[*].name",
+    ///     "users[*].*",
+    ///     "nowhere",
+    /// ]).unwrap();
+    ///
+    /// assert_eq!(set.count_per_query(&json), vec![2, 3, 0]);
+    /// ```
+    #[must_use]
+    pub fn count_per_query<'a>(&self, json: &'a Value<'a>) -> Vec<usize> {
+        self.count_per_query_limited(json, usize::MAX)
+    }
+
+    /// Like [`QueryDFASet::count_per_query`], but only the first `limit`
+    /// matched values (the ones [`QueryDFASet::find_limited`] would return)
+    /// are tallied, and the walk stops as soon as they have been seen. A
+    /// value matched by several queries counts once towards `limit` and once
+    /// for each of its queries.
+    #[must_use]
+    pub fn count_per_query_limited<'a>(
+        &self,
+        json: &'a Value<'a>,
+        limit: usize,
+    ) -> Vec<usize> {
+        let mut counts = vec![0; self.num_queries];
+        if limit == 0 {
+            return counts;
+        }
+        let mut seen = 0usize;
+        let _: ControlFlow<()> = DFAQueryEngine::visit_states_with_dfa(
+            json,
+            &self.dfa,
+            |state, _| {
+                for &query in &self.accepting_queries[state] {
+                    counts[query] += 1;
+                }
+                seen += 1;
+                if seen >= limit {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
+        counts
+    }
+
+    /// The queries (ascending) that match at least one value of `json`,
+    /// like `RegexSet::matches`. The walk stops as soon as every query of
+    /// the set has matched.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// use jsongrep::{Value, query::QueryDFASet};
+    ///
+    /// let json: Value = serde_json::from_str(r#"{"a": 1, "b": 2}"#).unwrap();
+    /// let set = QueryDFASet::from_query_strs(&["c", "b", "a"]).unwrap();
+    ///
+    /// assert_eq!(set.matching_queries(&json), vec![1, 2]);
+    /// ```
+    #[must_use]
+    pub fn matching_queries<'a>(&self, json: &'a Value<'a>) -> Vec<usize> {
+        let mut hit = vec![false; self.num_queries];
+        let mut remaining = self.num_queries;
+        let _: ControlFlow<()> = DFAQueryEngine::visit_states_with_dfa(
+            json,
+            &self.dfa,
+            |state, _| {
+                for &query in &self.accepting_queries[state] {
+                    if !hit[query] {
+                        hit[query] = true;
+                        remaining -= 1;
+                    }
+                }
+                if remaining == 0 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
+        hit.iter()
+            .enumerate()
+            .filter_map(|(query, &hit)| hit.then_some(query))
+            .collect()
+    }
+}
+
+/// Parses every query string, stopping at the first failure.
+fn parse_all<S: AsRef<str>>(
+    queries: &[S],
+) -> Result<Vec<Query>, QueryParseError> {
+    queries.iter().map(|q| q.as_ref().parse()).collect()
+}
+
 /// Builder for constructing a DFA from a given `Query` instance.
 struct DFABuilder {
     /// The constructed finite alphabet of extracted DFA symbols from the query.
@@ -664,8 +1069,8 @@ impl DFABuilder {
     /// the subset-construction inner loop: determinization then only walks
     /// the actual transitions of member NFA states instead of re-matching
     /// every label against every symbol for every DFA state.
-    fn label_to_symbols(&self, nfa: &QueryNFA) -> Vec<Vec<usize>> {
-        nfa.pos_to_label
+    fn label_to_symbols(&self, labels: &[TransitionLabel]) -> Vec<Vec<usize>> {
+        labels
             .iter()
             .map(|label| match label {
                 // A named field consumes exactly its own alphabet symbol.
@@ -731,19 +1136,21 @@ impl DFABuilder {
             .collect()
     }
 
-    /// Use subset construction to convert the constructed epsilon-free NFA to a DFA,
-    /// producing a `QueryDFA`. For each DFA state, we map it to a set of NFA
-    /// states, represented as a fixed-width bitset (`Vec<u64>`) to keep
-    /// hashing and set operations cheap.
-    fn determinize_nfa(
+    /// Use subset construction to convert the constructed epsilon-free NFAs to
+    /// a DFA, producing a `QueryDFA` together with, for every DFA state, the
+    /// ascending indices of the queries accepting in it (the DFA state is
+    /// accepting iff that list is non-empty). For each DFA state, we map it
+    /// to a set of NFA states, represented as a fixed-width bitset
+    /// (`Vec<u64>`) to keep hashing and set operations cheap.
+    fn determinize(
         &mut self,
-        nfa: &QueryNFA,
-    ) -> Result<QueryDFA, StateLimitExceeded> {
+        nfa: &QueryNFASet,
+    ) -> Result<(QueryDFA, Vec<Vec<usize>>), StateLimitExceeded> {
         let blocks = nfa.num_states.div_ceil(64);
         let alphabet_len = self.alphabet.len();
 
         // For each NFA label, which alphabet symbols it can consume.
-        let label_to_symbols = self.label_to_symbols(nfa);
+        let label_to_symbols = self.label_to_symbols(&nfa.pos_to_label);
 
         // Map from a set of NFA states (bitset) to its DFA state index.
         let mut nfa_states_to_dfa_state: HashMap<Vec<u64>, usize> =
@@ -758,17 +1165,19 @@ impl DFABuilder {
         // Transition table for the DFA
         let mut transitions: Vec<Vec<Option<usize>>> = Vec::new();
 
-        // Accepting states bitmap for the DFA
-        let mut is_accepting: Vec<bool> = Vec::new();
+        // Queries accepting in each DFA state
+        let mut accepting_queries: Vec<Vec<usize>> = Vec::new();
 
-        // Initialize with the start state (NFA start state)
+        // Initialize with the start state (all NFA start states at once)
         let mut start_set = vec![0u64; blocks];
-        start_set[nfa.start_state / 64] |= 1 << (nfa.start_state % 64);
+        for &start in &nfa.start_states {
+            start_set[start / 64] |= 1 << (start % 64);
+        }
+        accepting_queries.push(nfa.accepting_queries(&start_set));
         nfa_states_to_dfa_state.insert(start_set.clone(), 0);
         dfa_states.push(start_set);
         work_queue.push_back(0);
         transitions.push(vec![None; alphabet_len]);
-        is_accepting.push(nfa.is_accepting[nfa.start_state]);
 
         // Process each DFA state
         while let Some(current_dfa_state) = work_queue.pop_front() {
@@ -810,21 +1219,16 @@ impl DFABuilder {
                 {
                     dfa_state
                 } else {
-                    // New DFA state: accepting if any member NFA state is
-                    // accepting.
+                    // New DFA state: accepting for every query with an
+                    // accepting member NFA state.
                     let new_dfa_state = dfa_states.len();
                     if new_dfa_state >= self.max_states {
                         return Err(StateLimitExceeded {
                             limit: self.max_states,
                         });
                     }
-                    is_accepting.push(nfa.is_accepting.iter().enumerate().any(
-                        |(i, &accepting)| {
-                            accepting
-                                && next_nfa_states[i / 64] & (1 << (i % 64))
-                                    != 0
-                        },
-                    ));
+                    accepting_queries
+                        .push(nfa.accepting_queries(&next_nfa_states));
                     dfa_states.push(next_nfa_states.clone());
                     nfa_states_to_dfa_state
                         .insert(next_nfa_states, new_dfa_state);
@@ -839,17 +1243,21 @@ impl DFABuilder {
             }
         }
 
-        Ok(QueryDFA {
+        let dfa = QueryDFA {
             num_states: dfa_states.len(),
             start_state: 0,
-            is_accepting,
+            is_accepting: accepting_queries
+                .iter()
+                .map(|queries| !queries.is_empty())
+                .collect(),
             transitions,
             // use the existing constructed finite alphabet from the DFABuilder
             alphabet: std::mem::take(&mut self.alphabet),
             key_to_key_id: std::mem::take(&mut self.key_to_key_id),
             range_to_range_id: std::mem::take(&mut self.range_to_range_id),
             case_insensitive: self.case_insensitive,
-        })
+        };
+        Ok((dfa, accepting_queries))
     }
 
     /// Builds a deterministic finite automaton from a query.
@@ -893,10 +1301,35 @@ impl DFABuilder {
         self.finalize_ranges();
 
         // Create epsilon-free NFA via Glushkov construction
-        let nfa = QueryNFA::from_query(query);
+        let nfa = QueryNFASet::from_queries(std::slice::from_ref(query));
 
         // Determinize the NFA to achieve the DFA
-        self.determinize_nfa(&nfa)
+        self.determinize(&nfa).map(|(dfa, _)| dfa)
+    }
+
+    /// Builds one deterministic finite automaton recognizing the union of
+    /// several queries, tagging each state with the queries accepting in it.
+    ///
+    /// The alphabet is extracted from *all* queries up front, so field names
+    /// share symbols across queries and the disjoint index ranges partition
+    /// the union of every query's ranges. The queries' Glushkov NFAs are then
+    /// laid out in one state universe and determinized together.
+    fn build_set(
+        &mut self,
+        queries: &[Query],
+    ) -> Result<QueryDFASet, StateLimitExceeded> {
+        if self.max_states == 0 {
+            return Err(StateLimitExceeded { limit: 0 });
+        }
+
+        for query in queries {
+            self.extract_symbols(query);
+        }
+        self.finalize_ranges();
+
+        let nfa = QueryNFASet::from_queries(queries);
+        let (dfa, accepting_queries) = self.determinize(&nfa)?;
+        Ok(QueryDFASet { dfa, accepting_queries, num_queries: queries.len() })
     }
 }
 
@@ -907,10 +1340,11 @@ pub struct DFAQueryEngine;
 
 impl DFAQueryEngine {
     /// Performs a depth-first search over the JSON document AST, invoking the
-    /// visitor for each match. The visitor returns [`ControlFlow::Break`] to
-    /// stop the traversal early (e.g. after enough matches have been seen);
-    /// the break propagates straight up through the recursion, so an early
-    /// stop costs no further document work.
+    /// visitor with the accepting DFA state and the match. The visitor
+    /// returns [`ControlFlow::Break`] to stop the traversal early (e.g. after
+    /// enough matches have been seen); the break propagates straight up
+    /// through the recursion, so an early stop costs no further document
+    /// work.
     fn traverse_json<'a, B, F>(
         dfa: &QueryDFA,
         current_state: usize,
@@ -919,14 +1353,17 @@ impl DFAQueryEngine {
         visit: &mut F,
     ) -> ControlFlow<B>
     where
-        F: FnMut(JSONPointer<'a>) -> ControlFlow<B>,
+        F: FnMut(usize, JSONPointer<'a>) -> ControlFlow<B>,
     {
         // Check if current state is accepting
         if dfa.is_accepting_state(current_state) {
-            visit(JSONPointer {
-                path: path.clone(), // clone path only for result
-                value,
-            })?;
+            visit(
+                current_state,
+                JSONPointer {
+                    path: path.clone(), // clone path only for result
+                    value,
+                },
+            )?;
         }
 
         match value {
@@ -1038,6 +1475,20 @@ impl DFAQueryEngine {
     ) -> ControlFlow<B>
     where
         F: FnMut(JSONPointer<'a>) -> ControlFlow<B>,
+    {
+        Self::visit_states_with_dfa(json, dfa, |_, ptr| f(ptr))
+    }
+
+    /// Like [`DFAQueryEngine::visit_with_dfa`], but also hands the visitor
+    /// the accepting DFA state of each match, which is what lets a
+    /// [`QueryDFASet`] report the queries behind a match.
+    fn visit_states_with_dfa<'a, B, F>(
+        json: &'a Value<'a>,
+        dfa: &QueryDFA,
+        mut f: F,
+    ) -> ControlFlow<B>
+    where
+        F: FnMut(usize, JSONPointer<'a>) -> ControlFlow<B>,
     {
         let mut path = Vec::new();
         Self::traverse_json(dfa, dfa.start_state, &mut path, json, &mut f)

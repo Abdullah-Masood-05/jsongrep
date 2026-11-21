@@ -210,6 +210,23 @@ curl -s https://api.nobelprize.org/v1/prize.json | jq '[.. | .firstname? // empt
 1026
 ```
 
+**Several queries at once, with per-query attribution and counts:**
+
+```bash
+echo '{"users": [{"name": "Ada", "age": 36}]}' | jg -e 'users[*].name' -e 'users[*].*' --with-query --porcelain
+```
+
+```
+0,1:
+"Ada"
+1:
+36
+```
+
+With `--count`, `--with-query` prints one `QUERY:COUNT` line per query (in
+`-e` order) instead of the total; with `-l`, it prints `FILE:QUERIES`.
+`-m/--max-count` limits matched values, not matches per query.
+
 **Pretty-print JSON** (like `jq '.'`):
 
 ```bash
@@ -349,6 +366,8 @@ Arguments:
   [FILE]...  Optional path(s) to file(s). If omitted, reads from STDIN. With multiple files, the query is compiled once and run against each file, with a file heading before each file's matches
 
 Options:
+  -e, --query <QUERY>       Query to search for; may be given several times (like `grep -e`)
+      --with-query          Attribute every match to the queries that matched it
   -g, --glob <GLOB>         Include or exclude files and directories for searching that match the given glob
       --files               Prints the files that will be searched
   -l, --files-with-matches  Print only the names of files containing at least one match (like `grep -l`)
@@ -522,6 +541,19 @@ use jsongrep::query::QueryDFA;
 
 let dfa = QueryDFA::from_query_str("users[*].name")?;
 let results = dfa.find(&json);
+```
+
+Run several queries in one pass and learn which of them matched each value
+(`-e`/`--query` on the CLI compiles its queries the same way):
+
+```rust
+use jsongrep::query::QueryDFASet;
+
+let set = QueryDFASet::from_query_strs(&["users[*].name", "users[*].*"])?;
+for m in set.find(&json) {
+    // `m.queries` holds the indices of the matching queries, e.g. [0, 1]
+    println!("{:?}: {} (queries {:?})", m.pointer.path, m.pointer.value, m.queries);
+}
 ```
 
 Build queries programmatically with `QueryBuilder`:

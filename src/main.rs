@@ -16,11 +16,11 @@ use std::{
 
 use jsongrep::{
     cli::{
-        Format, WriteOptions, depth, is_broken_pipe, with_json,
-        write_colored_result,
+        Format, WriteOptions, depth, format_query_indices, is_broken_pipe,
+        with_json, write_attributed_result, write_colored_result,
     },
     commands,
-    query::{Query, QueryDFA},
+    query::{Query, QueryDFASet, SetMatch},
 };
 
 /// Ceiling on DFA states during query compilation. Subset construction is
@@ -48,6 +48,26 @@ struct Args {
     command: Option<Commands>,
     /// Query string (e.g., "**.name").
     query: Option<String>,
+    /// Query to search for; may be given several times (like `grep -e`).
+    ///
+    /// All queries are compiled into one automaton and run in a single pass.
+    /// A value matched by several queries is printed (and counted) once;
+    /// use --with-query to see which queries matched it. When this flag is
+    /// used, every positional argument is a FILE.
+    #[arg(short = 'e', long = "query", value_name = "QUERY")]
+    queries: Vec<String>,
+    /// Attribute every match to the queries that matched it.
+    ///
+    /// Queries are numbered from 0 in `-e` order (a positional query is
+    /// query 0). Each match gets a header line starting with the ascending,
+    /// comma-separated indices of its queries, followed by the path when
+    /// path headers are on: `0,2:users.[1].name:`. With --count, prints one
+    /// count per query instead of the total (`QUERY:COUNT` with
+    /// --porcelain, `FILE:QUERY:COUNT` with several files); with
+    /// --files-with-matches, prints `FILE:QUERIES`. Ignored for binary
+    /// output formats.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with_all = ["depth", "files"])]
+    with_query: bool,
     #[arg(value_name = "FILE")]
     /// Optional path(s) to file(s). If omitted, reads from STDIN. With
     /// multiple files, the query is compiled once and run against each
@@ -106,7 +126,10 @@ struct Args {
     /// Stop searching after NUM matches per input file.
     ///
     /// The limit applies to each input separately: with multiple files,
-    /// every file yields up to NUM matches. Each document's traversal
+    /// every file yields up to NUM matches. With several queries, NUM
+    /// counts matched values, not per query: a value matched by several
+    /// queries counts once, and --with-query counts only cover those first
+    /// NUM values. Each document's traversal
     /// terminates as soon as its limit is reached, so `--max-count 1` on a
     /// large document only pays for the work up to the first match.
     #[arg(short = 'm', long, value_name = "NUM", conflicts_with = "depth")]
@@ -234,8 +257,9 @@ fn run(mut args: Args) -> Result<bool> {
             // `--depth` takes only files, no query string. Clap parses the
             // first positional into `query`; move it into `inputs`.
             //
-            // `--files` takes optional filepath(s).
-            if (args.depth || args.files)
+            // `--files` takes optional filepath(s), and with `-e`/`--query`
+            // the positionals are all files (grep semantics).
+            if (args.depth || args.files || !args.queries.is_empty())
                 && let Some(query) = args.query.take()
             {
                 args.inputs.insert(0, PathBuf::from(query));
@@ -363,27 +387,49 @@ fn run(mut args: Args) -> Result<bool> {
                 return Ok(true);
             }
 
-            let raw_query = args.query.ok_or_else(|| {
-                anyhow::anyhow!("Query string required unless using subcommand")
-            })?;
-
-            let query: Query = if args.fixed_string {
-                // `-F`/`--fixed-string:` treat the query as a literal field name
-                // and search at any depth, equivalent to `(* | [*])*."<literal>"`
-                Query::recursive_depth_fixed_string(raw_query)
+            let raw_queries = if args.queries.is_empty() {
+                vec![args.query.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Query string required unless using subcommand"
+                    )
+                })?]
             } else {
-                raw_query.parse().with_context(|| "Failed to parse query")?
+                std::mem::take(&mut args.queries)
             };
 
-            // Compile the DFA once; run it against every input.
-            let dfa = if args.ignore_case {
-                QueryDFA::from_query_bounded_ignore_case(
-                    &query,
+            let queries = raw_queries
+                .into_iter()
+                .map(|raw_query| {
+                    if args.fixed_string {
+                        // `-F`/`--fixed-string:` treat the query as a literal
+                        // field name and search at any depth, equivalent to
+                        // `(* | [*])*."<literal>"`
+                        Ok(Query::recursive_depth_fixed_string(raw_query))
+                    } else {
+                        raw_query.parse().with_context(|| {
+                            format!("Failed to parse query `{raw_query}`")
+                        })
+                    }
+                })
+                .collect::<Result<Vec<Query>>>()?;
+
+            // Compile all queries into one DFA once; run it against every
+            // input. Unless matches are attributed to their queries, only
+            // the union language is needed (a value matched by several
+            // queries is printed once), so the set's union automaton runs
+            // directly.
+            let set = if args.ignore_case {
+                QueryDFASet::from_queries_bounded_ignore_case(
+                    &queries,
                     DEFAULT_MAX_DFA_STATES,
                 )
             } else {
-                QueryDFA::from_query_bounded(&query, DEFAULT_MAX_DFA_STATES)
+                QueryDFASet::from_queries_bounded(
+                    &queries,
+                    DEFAULT_MAX_DFA_STATES,
+                )
             }?;
+            let dfa = &set.dfa;
 
             if args.count || args.depth {
                 args.no_display = true;
@@ -409,12 +455,74 @@ fn run(mut args: Args) -> Result<bool> {
                 );
 
                 let file_result = with_json(input, format, |json| {
+                    let count_name = multi.then_some(name.as_str());
+
+                    // Per-query reports need no match list: tally the
+                    // queries in one walk.
+                    if args.with_query
+                        && !args.quiet
+                        && (args.files_with_matches || args.count)
+                    {
+                        // --max-count applies per input file and counts
+                        // matched values, whichever queries matched them.
+                        let counts = args.max_count.map(|limit| {
+                            set.count_per_query_limited(json, limit)
+                        });
+                        if args.files_with_matches {
+                            let hits = counts.map_or_else(
+                                || set.matching_queries(json),
+                                |counts| {
+                                    (0..counts.len())
+                                        .filter(|&query| counts[query] > 0)
+                                        .collect()
+                                },
+                            );
+                            if !hits.is_empty() {
+                                matched = true;
+                                writeln!(
+                                    writer,
+                                    "{}:{}",
+                                    name.magenta(),
+                                    format_query_indices(&hits).green()
+                                )?;
+                            }
+                        } else {
+                            let counts = counts
+                                .unwrap_or_else(|| set.count_per_query(json));
+                            matched |= counts.iter().any(|&count| count > 0);
+                            for (query, &count) in counts.iter().enumerate() {
+                                write_count(
+                                    &mut writer,
+                                    count_name,
+                                    Some(query),
+                                    count,
+                                    args.porcelain,
+                                )?;
+                            }
+                        }
+                        return Ok(());
+                    }
+
                     // --max-count applies per input file, so the limit
                     // resets for each document.
-                    let results = args.max_count.map_or_else(
-                        || dfa.find(json),
-                        |limit| dfa.find_limited(json, limit),
-                    );
+                    let results = if args.with_query {
+                        args.max_count.map_or_else(
+                            || set.find(json),
+                            |limit| set.find_limited(json, limit),
+                        )
+                    } else {
+                        args.max_count
+                            .map_or_else(
+                                || dfa.find(json),
+                                |limit| dfa.find_limited(json, limit),
+                            )
+                            .into_iter()
+                            .map(|pointer| SetMatch {
+                                pointer,
+                                queries: Vec::new(),
+                            })
+                            .collect()
+                    };
                     if !results.is_empty() {
                         matched = true;
                     }
@@ -431,30 +539,13 @@ fn run(mut args: Args) -> Result<bool> {
                     }
 
                     if args.count {
-                        if multi {
-                            // grep -c style per-file attribution.
-                            let styled_name = if args.porcelain {
-                                name.normal()
-                            } else {
-                                name.bold().magenta()
-                            };
-                            writeln!(
-                                writer,
-                                "{}:{}",
-                                styled_name,
-                                results.len()
-                            )?;
-                        } else if args.porcelain {
-                            writeln!(writer, "{}", results.len())?;
-                        } else {
-                            writeln!(
-                                writer,
-                                "{} {}",
-                                "Found matches:".bold().blue(),
-                                results.len()
-                            )
-                            .with_context(|| "Failed to write to stdout")?;
-                        }
+                        write_count(
+                            &mut writer,
+                            count_name,
+                            None,
+                            results.len(),
+                            args.porcelain,
+                        )?;
                     }
 
                     if args.depth {
@@ -487,19 +578,30 @@ fn run(mut args: Args) -> Result<bool> {
                         }
                         printed_block = true;
 
-                        let pretty = !args.compact;
+                        let options = WriteOptions {
+                            pretty: !args.compact,
+                            show_path,
+                            raw: args.raw_output,
+                            output_format: args.output,
+                        };
                         for result in &results {
-                            write_colored_result(
-                                &mut writer,
-                                result.value,
-                                &result.path,
-                                &WriteOptions {
-                                    pretty,
-                                    show_path,
-                                    raw: args.raw_output,
-                                    output_format: args.output,
-                                },
-                            )?;
+                            let pointer = &result.pointer;
+                            if args.with_query {
+                                write_attributed_result(
+                                    &mut writer,
+                                    pointer.value,
+                                    &pointer.path,
+                                    &result.queries,
+                                    &options,
+                                )?;
+                            } else {
+                                write_colored_result(
+                                    &mut writer,
+                                    pointer.value,
+                                    &pointer.path,
+                                    &options,
+                                )?;
+                            }
                         }
                     }
 
@@ -546,6 +648,37 @@ fn run(mut args: Args) -> Result<bool> {
     }
 
     Ok(matched)
+}
+
+/// Write one `--count` line: `NAME:COUNT` when `name` is given (several
+/// inputs, grep -c style), a bare number with `porcelain`, else a labeled
+/// number. A `query` index attributes the count to that query:
+/// `NAME:QUERY:COUNT`, `QUERY:COUNT`, or a label naming the query.
+fn write_count<W: Write>(
+    writer: &mut W,
+    name: Option<&str>,
+    query: Option<usize>,
+    count: usize,
+    porcelain: bool,
+) -> Result<()> {
+    let query_field =
+        query.map(|query| format!("{}:", query.to_string().green()));
+    let query_field = query_field.unwrap_or_default();
+    if let Some(name) = name {
+        let styled_name =
+            if porcelain { name.normal() } else { name.bold().magenta() };
+        writeln!(writer, "{styled_name}:{query_field}{count}")?;
+    } else if porcelain {
+        writeln!(writer, "{query_field}{count}")?;
+    } else {
+        let label = query.map_or_else(
+            || "Found matches:".to_string(),
+            |query| format!("Found matches for query {query}:"),
+        );
+        writeln!(writer, "{} {count}", label.bold().blue())
+            .with_context(|| "Failed to write to stdout")?;
+    }
+    Ok(())
 }
 
 /// Detect a format from the file extension, else use `JSON` or the explicit
